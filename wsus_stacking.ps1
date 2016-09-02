@@ -2,8 +2,9 @@
 # Windows PowerShell Skript to get WSUS statistics
 # output readable by NRPE for Nagios monitoring
 #
-# Version 1.1 created 2016-08-18
+# Version 1.0a created 2016-09-02
 ###############################################################################
+
 
 # Variables - set these to fit your needs
 ###############################################################################
@@ -19,26 +20,31 @@ $portNumber =   # for example 8531
 # warn if a computer has not contacted the server for ... days
 $daysBeforeWarn =   # for example 30
 
-# Script - don't change anything below this line!
-###############################################################################
 
 # load WSUS framework
-[void][reflection.assembly]::LoadWithPartialName("Microsoft.UpdateServices.Administration")   
+[void][reflection.assembly]::LoadWithPartialName("Microsoft.UpdateServices.Administration")
 
 # connect to specified WSUS server
 # see here for information of the IUpdateServer class
 # -> http://msdn.microsoft.com/en-us/library/microsoft.updateservices.administration.iupdateserver(VS.85).aspx
-$wsus = [Microsoft.UpdateServices.Administration.AdminProxy]::getUpdateServer($serverName, $useSecureConnection, $portNumber)   
+$wsus = [Microsoft.UpdateServices.Administration.AdminProxy]::getUpdateServer($serverName, $useSecureConnection, $portNumber)
+
+# Computer group ID
+# $wsus.GetComputerTargetGroups()
+# Additionally, replace s/"servers"/"your_computer_group_name"/;
+$servers_group = $wsus.GetComputerTargetGroup("your_UUID_here")
+
 
 # get general status information
 # see here for more infos about the properties of GetStatus()
 # -> http://msdn.microsoft.com/en-us/library/microsoft.updateservices.administration.updateserverstatus_properties(VS.85).aspx
 $status = $wsus.GetStatus()
-$totalComputers = $status.ComputerTargetCount
+$totalComputers = $servers_group.GetComputerTargets().count
 
 # computers with errors
 $computerTargetScope = new-object Microsoft.UpdateServices.Administration.ComputerTargetScope
 $computerTargetScope.IncludedInstallationStates = [Microsoft.UpdateServices.Administration.UpdateInstallationStates]::Failed
+$fnord = $computerTargetScope.ComputerTargetGroups.add($servers_group)
 $computersWithErrors = $wsus.GetComputerTargetCount($computerTargetScope)
 
 # computers with needed updates
@@ -50,10 +56,15 @@ $computersNeedingUpdates = $wsus.GetComputerTargetCount($computerTargetScope)
 $computerTargetScope = new-object Microsoft.UpdateServices.Administration.ComputerTargetScope
 $computerTargetScope.IncludedInstallationStates = [Microsoft.UpdateServices.Administration.UpdateInstallationStates]::Unknown
 $computerTargetScope.ExcludedInstallationStates = [Microsoft.UpdateServices.Administration.UpdateInstallationStates]::Failed -bor [Microsoft.UpdateServices.Administration.UpdateInstallationStates]::NotInstalled -bor [Microsoft.UpdateServices.Administration.UpdateInstallationStates]::InstalledPendingReboot -bor [Microsoft.UpdateServices.Administration.UpdateInstallationStates]::Downloaded
+$fnord = $computerTargetScope.ComputerTargetGroups.add($servers_group)
 $computersWithoutStatus = $wsus.GetComputerTargetCount($computerTargetScope)
+
+
 
 # computers that are OK
 $computersOK = $totalComputers - $computersWithErrors - $computersNeedingUpdates - $computersWithoutStatus
+
+
 
 # needed, but not approved updates
 $updateScope = new-object Microsoft.UpdateServices.Administration.UpdateScope
@@ -63,7 +74,7 @@ $updatesNeededByComputersNotApproved = $updateServerStatus.UpdatesNeededByComput
 
 # computers that did not contact the server in $daysBeforeWarn days
 $timeSpan = new-object TimeSpan($daysBeforeWarn, 0, 0, 0)
-$computersNotContacted = $wsus.GetComputersNotContactedSinceCount([DateTime]::UtcNow.Subtract($timeSpan))
+$computersNotContacted = ($wsus.GetComputersNotContactedSinceCount([DateTime]::UtcNow.Subtract($timeSpan)) | where {$_.RequestedTargetGroupName -eq "servers" }).count
 
 # computers in the "not assigned" group
 $computerTargetScope = new-object Microsoft.UpdateServices.Administration.ComputerTargetScope
@@ -76,87 +87,53 @@ $computersNotAssigned = $wsus.GetComputerTargetGroup([Microsoft.UpdateServices.A
 # 3: UNKNOWN
 $returnCode = 0
 $output = ''
-$perfdata = ''
-$Warn = 0
-$Crit = 0
-$help ="Help
-wsus_stacking.ps1 <option> <warning(INT)> <critical(INT)>
-option  - ComputersNeedingUpdates 	--> Shows count of clients that missing some updates
-		- ComputersWithErrors		--> Shows count of clients that have errors while last updating
-		- ComputersNotContacted		--> Shows count of clients that haven't contacted since fix days (could only be changed in script)
-		- ComputersNotAssigned		--> Shows count of clients that aren't assigned to WSUS
-		- UpdatesNeededByComputersNotApproved	--> Shows count of Updates that are needed but aren't approved yet"
 
-if ($args.Length -eq 3 -and $args[1] -is [int] -and $args[2] -is [int]) {
-	$Warn = $args[1]
-	$Crit = $args[2]
-	switch -case ($args[0]) {
-		
-		"ComputersNeedingUpdates" {
-			$output = "$computersNeedingUpdates Client(s) with missing updates."
-			if ($computersNeedingUpdates -gt $Warn) {
-				$returnCode = 1
-				if ($computersNeedingUpdates -gt $Crit) {
-					$returnCode = 2
-				}
-				$output = "$computersNeedingUpdates Client(s) need updates"
-			}
-			$perfdata = '|' + "'Clients missing updates'=$computersNeedingUpdates;$Warn;$Crit;0;$totalComputers"
-		}
-		"ComputersWithErrors" {
-			$output = "$computersWithErrors Client(s) with errors."
-			if ($computersWithErrors -gt $Warn) {
-				$returnCode = 1
-				if ($computersWithErrors -gt $Crit) {
-					$returnCode = 2
-				}
-				$output = "$computersWithErrors Client(s) with errors"
-			}
-			$perfdata = '|' + "Clients_with_errors=$computersWithErrors;$Warn;$Crit;0;$totalComputers"
-		}
-		"ComputersNotContacted" {
-			$output = "$computersNotContacted Client(s) haven't contacted WSUS within $daysBeforeWarn days."
-			if ($computersNotContacted -gt $Warn) {
-				$returnCode = 1
-				if ($computersNotContacted -gt $Crit) {
-					$returnCode = 2
-				}
-				$output = "$computersNotContacted Client(s) not contacted within $daysBeforeWarn days"
-			}
-			$perfdata = '|' + "Clients_not_contacted=$computersNotContacted;$Warn;$Crit;0;$totalComputers"
-		}
-		"ComputersNotAssigned" {
-			$output = "$computersNotAssigned Client(s) not assigned to WSUS."
-			if ($computersNotAssigned -gt $Warn) {
-				$returnCode = 1
-				if ($computersNotAssigned -gt $Crit) {
-					$returnCode = 2
-				}
-				$output = "$computersNotAssigned Client(s) are not assigned to a group"
-			}
-			$perfdata = '|' + "Clients_not_assigned=$computersNotAssigned;$Warn;$Crit;0;$totalComputers"
-		}
-		"UpdatesNeededByComputersNotApproved" {
-			$output = "$updatesNeededByComputersNotApproved update(s) needed but not approved."
-			if ($updatesNeededByComputersNotApproved -gt $Warn) {
-				$returnCode = 1
-				if ($updatesNeededByComputersNotApproved -gt $Crit) {
-					$returnCode = 2
-				}
-				$output = "$updatesNeededByComputersNotApproved update(s) needed but not approved"
-			}
-			$perfdata = '|' + "Unapproved_needed_updates=$updatesNeededByComputersNotApproved;$Warn;$Crit;0;$totalComputers"
-		}
-		default {
-			$output = $help
-		}
-	}
+if ($computersNeedingUpdates -gt 0) {
+	$returnCode = 1
+	$output = "$computersNeedingUpdates computers need updates"
 }
-else {
-	$output = $help
+
+if ($computersWithErrors -gt 0) {
+	$returnCode = 2
+	if ($output -ne '') {
+		$output = $output + ', '
+	}
+	$output = $output + "$computersWithErrors computers with errors"
+}
+
+if ($computersNotContacted -gt 0) {
+	$returnCode = 2
+	if ($output -ne '') {
+		$output = $output + ', '
+	}
+	$output = $output + "$computersNotContacted computers not contacted within $daysBeforeWarn days"
+}
+
+if ($computersNotAssigned -gt 0) {
+	$returnCode = 2
+	if ($output -ne '') {
+		$output = $output + ', '
+	}
+	$output = $output + "$computersNotAssigned computers are not assigned to a group"
+}
+
+if ($updatesNeededByComputersNotApproved -gt 0) {
+	$returnCode = 2
+	if ($output -ne '') {
+		$output = $output + ', '
+	}
+	$output = $output + "$updatesNeededByComputersNotApproved updates are needed but not approved"
+}
+
+if ($output -eq '') {
+	$output = 'all computers are assigned, active and up to date'
 }
 
 $output
-$perfdata
+# append performance data
+'|' + "'computers need updates'=$computersNeedingUpdates;;;0;$totalComputers"
+'|' + "'computers with errors'=$computersWithErrors;"
+"'computers without status'=$computersWithoutStatus;"
+"'computers OK'=$computersOK;"
 
-exit $returnCode
+$host.SetShouldExit($returnCode)
